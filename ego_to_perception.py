@@ -38,38 +38,49 @@ from unique_identifier_msgs.msg import UUID
 
 import yaml
 
+def shift_pose_forward(pose: Pose, offset_x: float) -> Pose:
+    """Return a copy of pose shifted forward along its local X-axis."""
+    from tf_transformations import quaternion_matrix
+
+    pose_shifted = Pose()
+    pose_shifted.orientation = pose.orientation
+
+    # Rotation matrix
+    quat = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
+    rot = quaternion_matrix(quat)[:3, :3]
+
+    # Shift vector in local X
+    offset_vector = np.array([offset_x, 0.0, 0.0])
+    world_offset = rot @ offset_vector
+
+    pose_shifted.position.x = pose.position.x + world_offset[0]
+    pose_shifted.position.y = pose.position.y + world_offset[1]
+    pose_shifted.position.z = pose.position.z + world_offset[2]
+
+    return pose_shifted
 
 def create_bounding_box_polygon(
     pose: Pose, base_to_front: float, base_to_rear: float, base_to_width: float
 ):
-    """Create a polygon footprint and dimension vector from vehicle shape and pose."""
-    # Vertices in local base_link frame (Z = 0)
-    local_corners = np.array(
-        [
-            [base_to_front, -base_to_width, 0.0],
-            [base_to_front, base_to_width, 0.0],
-            [-base_to_rear, base_to_width, 0.0],
-            [-base_to_rear, -base_to_width, 0.0],
-        ]
-    )
-
-    # Transform to world frame using quaternion and translation
-    quat = [
-        pose.orientation.x,
-        pose.orientation.y,
-        pose.orientation.z,
-        pose.orientation.w,
-    ]
+    """Create footprint polygon in map frame from vehicle dimensions and pose at base_link."""
+    local_corners = np.array([
+        [ base_to_front, -base_to_width, 0.0],
+        [ base_to_front,  base_to_width, 0.0],
+        [-base_to_rear,   base_to_width, 0.0],
+        [-base_to_rear,  -base_to_width, 0.0],
+    ])
+    
+    # Transform to world/map frame
+    quat = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
     trans = np.array([pose.position.x, pose.position.y, pose.position.z])
     rot_matrix = quaternion_matrix(quat)[:3, :3]
 
-    world_corners = [trans + rot_matrix @ corner for corner in local_corners]
+    world_corners = [trans + rot_matrix @ pt for pt in local_corners]
 
     polygon = Polygon()
     for pt in world_corners:
         polygon.points.append(Point32(x=pt[0], y=pt[1], z=pt[2]))
-    # Optionally close the polygon
-    polygon.points.append(polygon.points[0])
+    polygon.points.append(polygon.points[0])  # Close the loop
 
     return polygon
 
@@ -109,9 +120,10 @@ def make_car_classification() -> ObjectClassification:
 
 
 def load_vehicle_info(path: str) -> dict:
-    """Load vehicle dimensions from a YAML file."""
+    """Load vehicle parameters from a ROS 2-style YAML file with /**/ros__parameters."""
     with open(path, "r") as f:
-        return yaml.safe_load(f)
+        full_data = yaml.safe_load(f)
+    return full_data.get("/**", {}).get("ros__parameters", {})
 
 
 def get_geometry_params(vehicle_info: dict):
@@ -139,7 +151,7 @@ class TrajectoryListener(Node):
         static_uuid = uuid.UUID("12345678-1234-5678-1234-567812345678")
         self.object_id = to_ros_uuid(static_uuid)
         self.classification = make_car_classification()
-        vehicle_info = load_vehicle_info("vehicle_info.yaml")
+        vehicle_info = load_vehicle_info('/home/zulfaqarazmi/autoware/pilot-auto.x2.gen2/src/description/vehicle/j6_gen2_description/j6_gen2_description/config/vehicle_info.param.yaml')
 
         self.base_to_front, self.base_to_rear, self.base_to_width, self.height = (
             get_geometry_params(vehicle_info)
@@ -167,7 +179,7 @@ class TrajectoryListener(Node):
 
         self.create_subscription(
             AccelWithCovarianceStamped,
-            "/localization/acceleration",
+            '/localization/acceleration',
             self.acceleration_callback,
             10,
         )
@@ -184,18 +196,17 @@ class TrajectoryListener(Node):
         diffs = [t2 - t1 for t1, t2 in zip(times[:-1], times[1:])]
 
         predicted_path = PredictedPath()
+        self.kinematics.predicted_paths.clear()
         predicted_path.confidence = 1.0
         predicted_path.time_step = to_duration(sum(diffs) / len(diffs))
         predicted_path.path = [pt.pose for pt in msg.points]  # Use pose only
 
         self.kinematics.predicted_paths.append(predicted_path)
-        self.maybe_publish_predicted_object()
 
     def odometry_callback(self, msg: Odometry):
         """Handle incoming odometry messages."""
         self.kinematics.initial_pose_with_covariance = msg.pose
         self.kinematics.initial_twist_with_covariance = msg.twist
-        self.maybe_publish_predicted_object()
 
     def acceleration_callback(self, msg: AccelWithCovarianceStamped):
         """Handle incoming acceleration messages."""
@@ -204,6 +215,7 @@ class TrajectoryListener(Node):
 
     def get_shape(self, pose: Pose) -> Shape:
         """Create and return the shape of the predicted object."""
+
         shape = Shape()
         polygon = create_bounding_box_polygon(
             pose,
@@ -223,8 +235,12 @@ class TrajectoryListener(Node):
         self.predicted_object.classification.append(self.classification)
         self.predicted_object.existence_probability = 1.0
         self.predicted_object.kinematics = self.kinematics
+
+        shifted_pose = shift_pose_forward(
+            self.kinematics.initial_pose_with_covariance.pose,
+            (self.base_to_front - self.base_to_rear) / 2.0)
         self.predicted_object.shape = self.get_shape(
-            self.kinematics.initial_pose_with_covariance.pose
+            shifted_pose
         )
         predicted_objects = PredictedObjects()
         predicted_objects.header = Header(
